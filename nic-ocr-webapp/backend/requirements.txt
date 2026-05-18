@@ -31,7 +31,7 @@ markdown-it-py==4.2.0
 mdurl==0.1.2
 modelscope==1.36.3
 networkx==3.4.2
-numpy==2.3.5
+numpy==2.0.0
 opencv-contrib-python==4.10.0.84
 opencv-python==4.13.0.92
 opt-einsum==3.3.0

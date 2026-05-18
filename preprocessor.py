@@ -48,10 +48,8 @@ def denoise_image(image):
 
 def deskew_image(image):
     """Detect tilt angle and straighten the image."""
-    # Find edges
     edges = cv2.Canny(image, 50, 150, apertureSize=3)
 
-    # Detect lines using Hough transform
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
                              threshold=100,
                              minLineLength=100,
@@ -61,13 +59,11 @@ def deskew_image(image):
         print("[preprocessor] No lines detected — skipping deskew")
         return image
 
-    # Calculate the average angle of detected lines
     angles = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
         if x2 - x1 != 0:
             angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-            # Only consider near-horizontal lines (within 45 degrees)
             if -45 < angle < 45:
                 angles.append(angle)
 
@@ -77,14 +73,12 @@ def deskew_image(image):
 
     median_angle = np.median(angles)
 
-    # Only correct if the tilt is noticeable (more than 0.5 degrees)
     if abs(median_angle) < 0.5:
         print(f"[preprocessor] Image is straight (angle: {median_angle:.2f}°) — no deskew needed")
         return image
 
     print(f"[preprocessor] Deskewing by {median_angle:.2f}°")
 
-    # Rotate the image to correct the tilt
     height, width = image.shape[:2]
     center = (width // 2, height // 2)
     rotation_matrix = cv2.getRotationMatrix2D(center, median_angle, 1.0)
@@ -95,48 +89,75 @@ def deskew_image(image):
 
 
 def binarise_image(image):
-    """Convert to black and white using adaptive thresholding."""
+    """Convert to black and white using adaptive thresholding.
+    Best for Sinhala and English — not suitable for Tamil fine strokes."""
     binary = cv2.adaptiveThreshold(
         image,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        31,   # block size — must be odd number
-        10    # constant subtracted from mean
+        31,
+        10
     )
     print("[preprocessor] Binarisation applied")
     return binary
 
 
+def enhance_grayscale(image):
+    """
+    Enhance contrast on grayscale image using CLAHE.
+    Better than binarisation for Tamil fine strokes and curves —
+    preserves subtle stroke details that adaptive threshold destroys.
+    CLAHE = Contrast Limited Adaptive Histogram Equalisation.
+    """
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(image)
+    print("[preprocessor] CLAHE contrast enhancement applied")
+    return enhanced
+
+
 def preprocess(image_path):
     """
     Run the full pre-processing pipeline on an image.
-    Returns a Pillow Image ready for OCR.
+
+    Returns:
+        pil_binary    — binarised PIL image (kept for legacy compatibility)
+        cv_binary     — binarised numpy array (for PaddleOCR + Sinhala/English Tesseract)
+        cv_gray       — CLAHE enhanced grayscale numpy array (for Tamil Tesseract zones)
     """
     print("\n--- Pre-processing started ---")
 
-    image   = load_image(image_path)
-    image   = resize_image(image)
-    gray    = convert_to_grayscale(image)
-    gray    = denoise_image(gray)
-    gray    = deskew_image(gray)
-    binary  = binarise_image(gray)
+    image         = load_image(image_path)
+    image         = resize_image(image)
+    gray          = convert_to_grayscale(image)
+    gray          = denoise_image(gray)
+    gray          = deskew_image(gray)
 
-    # Convert OpenCV image (numpy array) to Pillow Image for Tesseract
-    pil_image = Image.fromarray(binary)
+    # Binary version — clean black/white for Sinhala/English + PaddleOCR
+    binary        = binarise_image(gray)
+
+    # Grayscale version — CLAHE enhanced for Tamil fine strokes
+    # Adaptive threshold destroys Tamil diacritics and thin curves
+    # CLAHE preserves them while still improving contrast
+    enhanced_gray = enhance_grayscale(gray)
+
+    pil_binary    = Image.fromarray(binary)
 
     print("--- Pre-processing complete ---\n")
-    return pil_image, binary   # return both: PIL for Tesseract, numpy for PaddleOCR
+
+    # Three return values now — update all callers accordingly
+    return pil_binary, binary, enhanced_gray 
 
 
 if __name__ == "__main__":
-    # Quick test — replace with your own image filename
     import sys
     if len(sys.argv) < 2:
         print("Usage: python preprocessor.py input_images/your_image.jpg")
     else:
-        pil_img, cv_img = preprocess(sys.argv[1])
-        # Save the pre-processed result so you can visually check it
-        output_path = "output/preprocessed_preview.jpg"
-        cv2.imwrite(output_path, cv_img)
-        print(f"Pre-processed image saved to: {output_path}")
+        pil_img, cv_binary, cv_gray = preprocess(sys.argv[1])
+        import os
+        os.makedirs("output", exist_ok=True)
+        cv2.imwrite("output/preprocessed_binary.jpg", cv_binary)
+        cv2.imwrite("output/preprocessed_gray.jpg",   cv_gray)
+        print("Saved: output/preprocessed_binary.jpg")
+        print("Saved: output/preprocessed_gray.jpg")

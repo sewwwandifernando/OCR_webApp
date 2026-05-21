@@ -18,44 +18,79 @@ paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# SCRIPT DETECTION
+# CHARACTER COUNTING HELPERS
 # ──────────────────────────────────────────────────────────────────────────
 
-def detect_script(text):
-    sinhala_count = 0
-    tamil_count   = 0
-    latin_count   = 0
+def count_sinhala(text):
+    return sum(1 for c in text if 0x0D80 <= ord(c) <= 0x0DFF)
 
-    for char in text:
-        code = ord(char)
-        if 0x0D80 <= code <= 0x0DFF:
-            sinhala_count += 1
-        elif 0x0B80 <= code <= 0x0BFF:
-            tamil_count += 1
-        elif (0x0041 <= code <= 0x005A or
-              0x0061 <= code <= 0x007A):
-            latin_count += 1
+def count_tamil(text):
+    return sum(1 for c in text if 0x0B80 <= ord(c) <= 0x0BFF)
 
-    # If Tamil chars present → Tamil
-    # Round 1 uses tam+eng so Tamil zones will produce Tamil Unicode cleanly
-    if tamil_count >= 2:
-        return "tamil"
+def count_latin(text):
+    return sum(1 for c in text
+               if (0x0041 <= ord(c) <= 0x005A or
+                   0x0061 <= ord(c) <= 0x007A))
 
-    # If clearly Latin dominant → English
-    if latin_count >= 4 and latin_count > sinhala_count:
-        return "english"
 
-    # Everything else → Sinhala
-    # Sinhala zones produce low/zero counts in Round 1 (tam+eng can't read Sinhala)
-    # sin_id handles these in Round 2
-    return "sinhala"
+# ──────────────────────────────────────────────────────────────────────────
+# THREE-PROBE SCRIPT DETECTION
+# Kept here for fallback / non-NIC use cases.
+# NOT called for NIC cards — ocr_service.py uses layout mapping instead,
+# which knows the script of every field in advance.
+# ──────────────────────────────────────────────────────────────────────────
+
+def detect_script_threeway(crop_gray, crop_binary, config):
+    """
+    Run three independent Tesseract probes and vote on the winner.
+    Returns one of: "tamil" | "sinhala" | "english"
+    """
+    scores = {"tamil": 0, "sinhala": 0, "english": 0}
+
+    try:
+        pil_gray = Image.fromarray(crop_gray)
+        out_tam  = pytesseract.image_to_string(pil_gray, lang="tam", config=config)
+        tc = count_tamil(out_tam)
+        scores["tamil"] = tc * 3
+        print(f"    [ProbeA/tam]  tamil_chars={tc}  score={scores['tamil']}")
+    except Exception as e:
+        print(f"    [ProbeA/tam]  ERROR: {e}")
+
+    try:
+        pil_bin  = Image.fromarray(crop_binary)
+        out_sin  = pytesseract.image_to_string(pil_bin, lang="sin", config=config)
+        sc = count_sinhala(out_sin)
+        scores["sinhala"] = sc * 3
+        print(f"    [ProbeB/sin]  sinhala_chars={sc}  score={scores['sinhala']}")
+    except Exception as e:
+        print(f"    [ProbeB/sin]  ERROR: {e}")
+
+    try:
+        pil_bin  = Image.fromarray(crop_binary)
+        out_eng  = pytesseract.image_to_string(pil_bin, lang="eng", config=config)
+        lc = count_latin(out_eng)
+        scores["english"] = lc if lc >= 6 else 0
+        print(f"    [ProbeC/eng]  latin_chars={lc}  score={scores['english']}")
+    except Exception as e:
+        print(f"    [ProbeC/eng]  ERROR: {e}")
+
+    best_script = max(scores, key=scores.get)
+    best_score  = scores[best_script]
+
+    if best_score == 0:
+        print(f"    [Vote] All probes zero → fallback: sinhala")
+        return "sinhala"
+
+    print(f"    [Vote] scores={scores} → winner: {best_script}")
+    return best_script
 
 
 def get_tesseract_lang(script):
+    """Map detected script to the best Tesseract model for final reading."""
     mapping = {
         "sinhala": "sin_id",
         "tamil":   "tam",
-        "english": "eng"
+        "english": "eng",
     }
     return mapping.get(script, "eng")
 
@@ -63,7 +98,7 @@ def get_tesseract_lang(script):
 # ──────────────────────────────────────────────────────────────────────────
 # ZONE DETECTION — PaddleOCR
 # Only used for bounding box LOCATIONS.
-# PaddleOCR is English-only so its text is not trusted for script detection.
+# PaddleOCR text output is not trusted for script detection.
 # ──────────────────────────────────────────────────────────────────────────
 
 def detect_text_zones(image_path):
@@ -85,7 +120,7 @@ def detect_text_zones(image_path):
         for text, score, poly in zip(texts, scores, polys):
             zones.append({
                 "box":        poly.tolist() if hasattr(poly, "tolist") else poly,
-                "text":       text,       # kept for reference only, not used for script detection
+                "text":       text,
                 "confidence": round(float(score), 3),
             })
 
@@ -118,10 +153,8 @@ def crop_zone(image, box):
 
 def upscale_if_small(img, min_height=60):
     """
-    Upscale small crops so Tesseract has enough pixels to work with.
-    Tamil fine strokes are very thin — if the crop is too small,
-    even CLAHE grayscale won't give Tesseract enough detail.
-    min_height=60px is the safe minimum for reliable Tesseract output.
+    Upscale small crops so Tesseract has enough pixels.
+    Tamil fine strokes are thin — crops below 60px height lose detail.
     """
     h, w = img.shape[:2]
     if h < min_height:
@@ -132,83 +165,121 @@ def upscale_if_small(img, min_height=60):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TEXT READING — Tesseract (Two Round Approach)
-#
-# Round 1 — grayscale crop + "tam+eng" only → real Unicode output
-#            sin_id is excluded from Round 1 entirely because it is a
-#            custom-trained model that dominates all other langs when combined,
-#            causing it to misread Tamil glyphs as Sinhala Unicode.
-#            tam+eng is sufficient to detect script:
-#              Tamil Unicode appears  → Tamil zone
-#              Latin chars dominant   → English zone
-#              Neither (low counts)   → Sinhala zone (fallback)
-#
-# Round 2 — detect script from Round 1 Unicode → pick correct single model
-#            Tamil   → grayscale crop + "tam"    (fine strokes preserved)
-#            English → binary crop   + "eng"     (clean contrast)
-#            Sinhala → binary crop   + "sin_id"  (custom NIC model)
+# CANONICAL WARP HELPER
 # ──────────────────────────────────────────────────────────────────────────
 
-def read_zone_with_tesseract(cropped_binary, cropped_gray=None, lang=None):
+def warp_to_canonical(image, target_w=800, target_h=504):
     """
-    cropped_binary — binarised crop (numpy array) for Sinhala/English
-    cropped_gray   — CLAHE grayscale crop (numpy array) for Tamil
-    lang           — if provided, skip two-round and use directly
+    Resize image to a fixed canonical size.
+    Call this on both cv_binary and cv_gray before applying layout crops.
     """
-    config = f"--psm 6 --oem 3 --tessdata-dir {TESSDATA_DIR}"
+    return cv2.resize(image, (target_w, target_h),
+                      interpolation=cv2.INTER_CUBIC)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEXT READING — Tesseract  (UPDATED FOR PRIORITY 3)
+#
+# WHAT CHANGED:
+#   Two new optional parameters added:
+#
+#   config (str | None):
+#     Lets ocr_service.py pass a per-field Tesseract config string,
+#     e.g. "--psm 7 --oem 1" for single-line fields.
+#     When None (probe path / old callers), falls back to the default
+#     "--psm 6 --oem 3" as before — so nothing breaks.
+#
+#   crop_override (numpy array | None):
+#     Lets ocr_service.py pass a PREPROCESSED crop (e.g. already upscaled
+#     2×) as the image to read, instead of the raw crop_binary/crop_gray.
+#     When None, the function chooses the image itself as before.
+#
+# WHY crop_override IS NEEDED:
+#   ocr_service._extract_fields now applies upscaling and image-type
+#   selection BEFORE calling this function. Without crop_override, those
+#   changes would be ignored and the raw (non-upscaled) crop would be
+#   read instead. crop_override lets the caller say "use THIS image".
+#
+# BACKWARDS COMPATIBILITY:
+#   Both new parameters default to None.
+#   All existing callers (the probe path, __main__) pass neither parameter
+#   and continue to work exactly as before.
+# ══════════════════════════════════════════════════════════════════════════
+
+def read_zone_with_tesseract(
+    cropped_binary,
+    cropped_gray=None,
+    lang=None,
+    config=None,
+    crop_override=None,
+):
+    """
+    cropped_binary  — binarised crop (numpy array)
+    cropped_gray    — CLAHE grayscale crop (numpy array), used for Tamil
+    lang            — if provided, skip detection and use this lang directly
+    config          — Tesseract config string, e.g. "--psm 7 --oem 1"
+                      If None, defaults to "--psm 6 --oem 3"
+    crop_override   — if provided, use THIS numpy array as the OCR input
+                      instead of choosing between cropped_binary/cropped_gray.
+                      Used by ocr_service to pass pre-upscaled crops.
+    """
+
+    # ── Default config (used when caller does not specify one) ─────────────
+    # oem 3 = "best available engine" (legacy fallback for probe path)
+    # ocr_service always passes oem 1 explicitly via the config parameter
+    default_config = f"--psm 6 --oem 3 --tessdata-dir {TESSDATA_DIR}"
+
+    # ── Append tessdata dir to caller-supplied config if not present ───────
+    if config is not None:
+        if "--tessdata-dir" not in config:
+            tess_config = f"{config} --tessdata-dir {TESSDATA_DIR}"
+        else:
+            tess_config = config
+    else:
+        tess_config = default_config
+
+    # ── Fast path: lang already known (called from ocr_service layout map) ─
     if lang is not None:
-        # Single round — lang already known
-        pil_image = Image.fromarray(upscale_if_small(cropped_binary))
-        text = pytesseract.image_to_string(pil_image, lang=lang, config=config)
+
+        # If the caller pre-processed the crop (upscaled, image-type chosen),
+        # use that directly. Otherwise fall back to the standard selection.
+        if crop_override is not None:
+            pil_image = Image.fromarray(crop_override)
+        elif lang == "tam" and cropped_gray is not None:
+            pil_image = Image.fromarray(upscale_if_small(cropped_gray))
+        else:
+            pil_image = Image.fromarray(upscale_if_small(cropped_binary))
+
+        text = pytesseract.image_to_string(pil_image, lang=lang, config=tess_config)
         return text.strip()
 
-    # ── Round 1 ───────────────────────────────────────────────────────────
-    # Use grayscale so Tamil fine strokes are intact.
-    # sin_id is excluded — it overpowers tam even when listed last,
-    # misreading Tamil glyphs as Sinhala and producing zero Tamil Unicode.
-    # tam+eng is enough for script detection purposes.
-    round1_src  = cropped_gray if cropped_gray is not None else cropped_binary
-    round1_src  = upscale_if_small(round1_src)
-    pil_round1  = Image.fromarray(round1_src)
-    round1_text = pytesseract.image_to_string(
-        pil_round1, lang="tam+eng", config=config
-    )
+    # ── Probe path: lang unknown (non-NIC fallback, __main__ quick test) ───
+    probe_gray   = upscale_if_small(cropped_gray if cropped_gray is not None
+                                    else cropped_binary)
+    probe_binary = upscale_if_small(cropped_binary)
 
-    print(f"    [Round1 raw]: {repr(round1_text[:80])}")
-
-    # Debug: character count breakdown after Round 1
-    # Shows how many Sinhala / Tamil / Latin chars Round 1 produced.
-    # Verify Tamil zones produce Tamil Unicode and sin_id is not interfering.
-    # Remove or comment out once Tamil output is confirmed working.
-    print(f"    [Round1 counts] "
-          f"sin:{sum(1 for c in round1_text if 0x0D80 <= ord(c) <= 0x0DFF)} "
-          f"tam:{sum(1 for c in round1_text if 0x0B80 <= ord(c) <= 0x0BFF)} "
-          f"lat:{sum(1 for c in round1_text if 0x0041 <= ord(c) <= 0x007A)}")
-
-    # ── Script detection on Round 1 Unicode output ────────────────────────
-    script         = detect_script(round1_text)
+    # Use a psm 6 config for probing (block of text assumption)
+    probe_config   = default_config
+    script         = detect_script_threeway(probe_gray, probe_binary, probe_config)
     tesseract_lang = get_tesseract_lang(script)
 
-    print(f"    [two-round] Script: {script} → lang: {tesseract_lang}")
+    print(f"    [Detection] Script: {script} → Final model: {tesseract_lang}")
 
-    # ── Round 2 ───────────────────────────────────────────────────────────
-    # Tamil   → grayscale (CLAHE): fine strokes preserved → better accuracy
-    # Others  → binary:            clean high contrast    → better accuracy
     if script == "tamil" and cropped_gray is not None:
-        pil_round2 = Image.fromarray(upscale_if_small(cropped_gray))
+        pil_final = Image.fromarray(upscale_if_small(cropped_gray))
     else:
-        pil_round2 = Image.fromarray(upscale_if_small(cropped_binary))
+        pil_final = Image.fromarray(upscale_if_small(cropped_binary))
 
-    round2_text = pytesseract.image_to_string(
-        pil_round2, lang=tesseract_lang, config=config
+    final_text = pytesseract.image_to_string(
+        pil_final, lang=tesseract_lang, config=tess_config
     )
 
-    return round2_text.strip()
+    return final_text.strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# FULL OCR PIPELINE
+# FULL OCR PIPELINE (used by __main__ quick test only)
+# NOTE: For NIC cards via the web app, ocr_service.py is used instead.
 # ──────────────────────────────────────────────────────────────────────────
 
 def run_ocr(image_path, preprocessed_cv_binary, preprocessed_cv_gray=None):
@@ -226,7 +297,7 @@ def run_ocr(image_path, preprocessed_cv_binary, preprocessed_cv_gray=None):
 
     results = []
 
-    print("\n--- Tesseract: reading each zone (two-round) ---")
+    print("\n--- Tesseract: reading each zone (three-probe detection) ---")
 
     for i, zone in enumerate(zones):
         cropped_binary = crop_zone(preprocessed_cv_binary, zone["box"])
@@ -237,24 +308,33 @@ def run_ocr(image_path, preprocessed_cv_binary, preprocessed_cv_gray=None):
             print(f"[ocr_engine] Zone {i+1}: empty crop — skipped")
             continue
 
+        print(f"\n  Zone {i+1:02d}:")
+        # No lang or config passed here — uses the probe path
         tesseract_text = read_zone_with_tesseract(cropped_binary, cropped_gray)
 
-        script         = detect_script(tesseract_text)
-        tesseract_lang = get_tesseract_lang(script)
+        from collections import Counter
+        char_counts = Counter({
+            "sinhala": count_sinhala(tesseract_text),
+            "tamil":   count_tamil(tesseract_text),
+            "english": count_latin(tesseract_text),
+        })
+        display_script = char_counts.most_common(1)[0][0] \
+                         if char_counts.most_common(1)[0][1] > 0 else "unknown"
+        display_lang   = get_tesseract_lang(display_script)
 
         result = {
             "zone":           i + 1,
             "paddle_text":    zone["text"],
             "tesseract_text": tesseract_text,
             "confidence":     zone["confidence"],
-            "script":         script,
-            "tesseract_lang": tesseract_lang,
+            "script":         display_script,
+            "tesseract_lang": display_lang,
         }
 
         results.append(result)
 
-        print(f"  Zone {i+1:02d} | Script: {script:8s} | "
-              f"Lang: {tesseract_lang:6s} | "
+        print(f"  Zone {i+1:02d} | Script: {display_script:8s} | "
+              f"Lang: {display_lang:6s} | "
               f"Text: {tesseract_text[:50]!r}")
 
     print("\n========== OCR ENGINE COMPLETE ==========")
@@ -275,13 +355,12 @@ if __name__ == "__main__":
     else:
         image_path = sys.argv[1]
 
-        # preprocessor now returns 3 values
         pil_img, cv_binary, cv_gray = preprocess(image_path)
 
         results = run_ocr(image_path, cv_binary, cv_gray)
 
         os.makedirs("output", exist_ok=True)
-        image_stem = os.path.splitext(os.path.basename(image_path))[0]
+        image_stem  = os.path.splitext(os.path.basename(image_path))[0]
         output_path = f"output/{image_stem}_ocr.md"
 
         with open(output_path, "w", encoding="utf-8") as f:

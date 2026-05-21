@@ -20,13 +20,27 @@ async def run_ocr_endpoint(
     conn: DB,
     file: UploadFile = File(...),
     nic_type: str = Form(default="new"),
+    side: str = Form(default="front"),
 ):
+    # ── Validate file ──────────────────────────────────────────────────────
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
+    # ── Validate nic_type ──────────────────────────────────────────────────
     if nic_type not in ("new", "old"):
-        raise HTTPException(status_code=400, detail="nic_type must be 'new' or 'old'")
+        raise HTTPException(
+            status_code=400,
+            detail="nic_type must be 'new' or 'old'",
+        )
 
+    # ── Validate side ──────────────────────────────────────────────────────
+    if side not in ("front", "back"):
+        raise HTTPException(
+            status_code=400,
+            detail="side must be 'front' or 'back'",
+        )
+
+    # ── Save uploaded file to temp path ───────────────────────────────────
     output_dir = os.path.join(settings.storage_path, "output")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -37,8 +51,9 @@ async def run_ocr_endpoint(
     async with aiofiles.open(tmp_path, "wb") as f:
         await f.write(contents)
 
+    # ── Run OCR and clean up temp file ────────────────────────────────────
     try:
-        result = run_ocr(tmp_path, nic_type)
+        result = run_ocr(tmp_path, nic_type=nic_type, side=side)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
